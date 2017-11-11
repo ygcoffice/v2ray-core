@@ -1,57 +1,38 @@
 package protocol
 
-import (
-	"github.com/v2ray/v2ray-core/common/dice"
-)
+import "time"
 
-type UserLevel byte
+func (u *User) GetTypedAccount() (Account, error) {
+	if u.GetAccount() == nil {
+		return nil, newError("Account missing").AtWarning()
+	}
 
-const (
-	UserLevelAdmin     = UserLevel(255)
-	UserLevelUntrusted = UserLevel(0)
-)
-
-type User struct {
-	ID       *ID
-	AlterIDs []*ID
-	Level    UserLevel
+	rawAccount, err := u.Account.GetInstance()
+	if err != nil {
+		return nil, err
+	}
+	if asAccount, ok := rawAccount.(AsAccount); ok {
+		return asAccount.AsAccount()
+	}
+	if account, ok := rawAccount.(Account); ok {
+		return account, nil
+	}
+	return nil, newError("Unknown account type: ", u.Account.Type)
 }
 
-func NewUser(id *ID, level UserLevel, alterIdCount uint16) *User {
-	u := &User{
-		ID:    id,
-		Level: level,
+func (u *User) GetSettings() UserSettings {
+	settings := UserSettings{}
+	switch u.Level {
+	case 0:
+		settings.PayloadTimeout = time.Second * 30
+	case 1:
+		settings.PayloadTimeout = time.Minute * 2
+	default:
+		settings.PayloadTimeout = time.Minute * 5
 	}
-	if alterIdCount > 0 {
-		u.AlterIDs = make([]*ID, alterIdCount)
-		prevId := id.UUID()
-		for idx := range u.AlterIDs {
-			newid := prevId.Next()
-			// TODO: check duplicate
-			u.AlterIDs[idx] = NewID(newid)
-			prevId = newid
-		}
-	}
-	return u
-}
-
-func (this *User) AnyValidID() *ID {
-	if len(this.AlterIDs) == 0 {
-		return this.ID
-	}
-	return this.AlterIDs[dice.Roll(len(this.AlterIDs))]
+	return settings
 }
 
 type UserSettings struct {
-	PayloadReadTimeout int
-}
-
-func GetUserSettings(level UserLevel) UserSettings {
-	settings := UserSettings{
-		PayloadReadTimeout: 120,
-	}
-	if level > 0 {
-		settings.PayloadReadTimeout = 0
-	}
-	return settings
+	PayloadTimeout time.Duration
 }

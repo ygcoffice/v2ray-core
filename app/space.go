@@ -1,89 +1,130 @@
 package app
 
-type ID int
+import (
+	"context"
+	"reflect"
 
-// Context of a function call from proxy to app.
-type Context interface {
-	CallerTag() string
+	"v2ray.com/core/common"
+)
+
+type Application interface {
+	Interface() interface{}
+	Start() error
+	Close()
+}
+
+type InitializationCallback func() error
+
+func CreateAppFromConfig(ctx context.Context, config interface{}) (Application, error) {
+	application, err := common.CreateObject(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	switch a := application.(type) {
+	case Application:
+		return a, nil
+	default:
+		return nil, newError("not an application")
+	}
 }
 
 // A Space contains all apps that may be available in a V2Ray runtime.
 // Caller must check the availability of an app by calling HasXXX before getting its instance.
 type Space interface {
-	HasApp(ID) bool
-	GetApp(ID) interface{}
-}
-
-type ForContextCreator func(Context, interface{}) interface{}
-
-var (
-	metadataCache = make(map[ID]ForContextCreator)
-)
-
-func RegisterApp(id ID, creator ForContextCreator) {
-	// TODO: check id
-	metadataCache[id] = creator
-}
-
-type contextImpl struct {
-	callerTag string
-}
-
-func (this *contextImpl) CallerTag() string {
-	return this.callerTag
+	GetApplication(appInterface interface{}) Application
+	AddApplication(application Application) error
+	Initialize() error
+	OnInitialize(InitializationCallback)
+	Start() error
+	Close()
 }
 
 type spaceImpl struct {
-	cache map[ID]interface{}
-	tag   string
+	initialized bool
+	cache       map[reflect.Type]Application
+	appInit     []InitializationCallback
 }
 
-func newSpaceImpl(tag string, cache map[ID]interface{}) *spaceImpl {
-	space := &spaceImpl{
-		tag:   tag,
-		cache: make(map[ID]interface{}),
+func NewSpace() Space {
+	return &spaceImpl{
+		cache:   make(map[reflect.Type]Application),
+		appInit: make([]InitializationCallback, 0, 32),
 	}
-	context := &contextImpl{
-		callerTag: tag,
+}
+
+func (s *spaceImpl) OnInitialize(f InitializationCallback) {
+	if s.initialized {
+		f()
+	} else {
+		s.appInit = append(s.appInit, f)
 	}
-	for id, object := range cache {
-		creator, found := metadataCache[id]
-		if found {
-			space.cache[id] = creator(context, object)
+}
+
+func (s *spaceImpl) Initialize() error {
+	for _, f := range s.appInit {
+		if err := f(); err != nil {
+			return err
 		}
 	}
-	return space
+	s.appInit = nil
+	s.initialized = true
+	return nil
 }
 
-func (this *spaceImpl) HasApp(id ID) bool {
-	_, found := this.cache[id]
-	return found
-}
-
-func (this *spaceImpl) GetApp(id ID) interface{} {
-	obj, found := this.cache[id]
-	if !found {
+func (s *spaceImpl) GetApplication(appInterface interface{}) Application {
+	if s == nil {
 		return nil
 	}
-	return obj
+	appType := reflect.TypeOf(appInterface)
+	return s.cache[appType]
 }
 
-// A SpaceController is supposed to be used by a shell to create Spaces. It should not be used
-// directly by proxies.
-type SpaceController struct {
-	objectCache map[ID]interface{}
+func (s *spaceImpl) AddApplication(app Application) error {
+	if s == nil {
+		return newError("nil space").AtError()
+	}
+	appType := reflect.TypeOf(app.Interface())
+	s.cache[appType] = app
+	return nil
 }
 
-func NewController() *SpaceController {
-	return &SpaceController{
-		objectCache: make(map[ID]interface{}),
+func (s *spaceImpl) Start() error {
+	for _, app := range s.cache {
+		if err := app.Start(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *spaceImpl) Close() {
+	for _, app := range s.cache {
+		app.Close()
 	}
 }
 
-func (this *SpaceController) Bind(id ID, object interface{}) {
-	this.objectCache[id] = object
+type contextKey int
+
+const (
+	spaceKey = contextKey(0)
+)
+
+func AddApplicationToSpace(ctx context.Context, appConfig interface{}) error {
+	space := SpaceFromContext(ctx)
+	if space == nil {
+		return newError("no space in context").AtError()
+	}
+	application, err := CreateAppFromConfig(ctx, appConfig)
+	if err != nil {
+		return err
+	}
+	return space.AddApplication(application)
 }
 
-func (this *SpaceController) ForContext(tag string) Space {
-	return newSpaceImpl(tag, this.objectCache)
+func SpaceFromContext(ctx context.Context) Space {
+	return ctx.Value(spaceKey).(Space)
+}
+
+func ContextWithSpace(ctx context.Context, space Space) context.Context {
+	return context.WithValue(ctx, spaceKey, space)
 }

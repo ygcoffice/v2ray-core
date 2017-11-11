@@ -1,25 +1,38 @@
-// Package core provides common definitions and functionalities of V2Ray.
+// Package core provides an entry point to use V2Ray core functionalities.
+//
+// V2Ray makes it possible to accept incoming network connections with certain
+// protocol, process the data, and send them through another connection with
+// the same or a difference protocol on demand.
+//
+// It may be configured to work with multiple protocols at the same time, and
+// uses the internal router to tunnel through different inbound and outbound
+// connections.
 package core
+
+//go:generate go run $GOPATH/src/v2ray.com/core/tools/generrorgen/main.go -pkg core -path Core
 
 import (
 	"fmt"
 
-	"github.com/v2ray/v2ray-core/common/platform"
+	"v2ray.com/core/common/platform"
 )
 
 var (
-	version  = "1.7"
+	version  = "2.48"
 	build    = "Custom"
-	codename = "New Order"
+	codename = "One for all"
 	intro    = "An unified platform for anti-censorship."
 )
 
+// Version returns V2Ray's version as a string, in the form of "x.y.z" where x, y and z are numbers.
+// ".z" part may be omitted in regular releases.
 func Version() string {
 	return version
 }
 
+// PrintVersion prints current version into console.
 func PrintVersion() {
-	fmt.Printf("V2Ray %s (%s) %s%s", version, codename, build, platform.LineSeparator())
+	fmt.Printf("V2Ray %s (%s) %s%s", Version(), codename, build, platform.LineSeparator())
 	fmt.Printf("%s%s", intro, platform.LineSeparator())
 }
 

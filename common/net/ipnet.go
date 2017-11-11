@@ -1,28 +1,21 @@
 package net
 
 import (
+	"math/bits"
 	"net"
 )
 
-var (
-	onesCount = make(map[byte]byte)
-)
-
-type IPNet struct {
+type IPNetTable struct {
 	cache map[uint32]byte
 }
 
-func NewIPNet() *IPNet {
-	return NewIPNetInitialValue(make(map[uint32]byte, 1024))
-}
-
-func NewIPNetInitialValue(data map[uint32]byte) *IPNet {
-	return &IPNet{
-		cache: data,
+func NewIPNetTable() *IPNetTable {
+	return &IPNetTable{
+		cache: make(map[uint32]byte, 1024),
 	}
 }
 
-func ipToUint32(ip net.IP) uint32 {
+func ipToUint32(ip IP) uint32 {
 	value := uint32(0)
 	for _, b := range []byte(ip) {
 		value <<= 8
@@ -34,34 +27,39 @@ func ipToUint32(ip net.IP) uint32 {
 func ipMaskToByte(mask net.IPMask) byte {
 	value := byte(0)
 	for _, b := range []byte(mask) {
-		value += onesCount[b]
+		value += byte(bits.OnesCount8(b))
 	}
 	return value
 }
 
-func (this *IPNet) Add(ipNet *net.IPNet) {
+func (n *IPNetTable) Add(ipNet *net.IPNet) {
 	ipv4 := ipNet.IP.To4()
 	if ipv4 == nil {
 		// For now, we don't support IPv6
 		return
 	}
-	value := ipToUint32(ipv4)
 	mask := ipMaskToByte(ipNet.Mask)
-	existing, found := this.cache[value]
+	n.AddIP(ipv4, mask)
+}
+
+func (n *IPNetTable) AddIP(ip []byte, mask byte) {
+	k := ipToUint32(ip)
+	k = (k >> (32 - mask)) << (32 - mask) // normalize ip
+	existing, found := n.cache[k]
 	if !found || existing > mask {
-		this.cache[value] = mask
+		n.cache[k] = mask
 	}
 }
 
-func (this *IPNet) Contains(ip net.IP) bool {
+func (n *IPNetTable) Contains(ip net.IP) bool {
 	ipv4 := ip.To4()
 	if ipv4 == nil {
 		return false
 	}
 	originalValue := ipToUint32(ipv4)
 
-	if entry, found := this.cache[originalValue]; found {
-		if entry == 0 {
+	if entry, found := n.cache[originalValue]; found {
+		if entry == 32 {
 			return true
 		}
 	}
@@ -71,7 +69,7 @@ func (this *IPNet) Contains(ip net.IP) bool {
 		mask += 1 << uint32(32-maskbit)
 
 		maskedValue := originalValue & mask
-		if entry, found := this.cache[maskedValue]; found {
+		if entry, found := n.cache[maskedValue]; found {
 			if entry == maskbit {
 				return true
 			}
@@ -80,18 +78,6 @@ func (this *IPNet) Contains(ip net.IP) bool {
 	return false
 }
 
-func (this *IPNet) Serialize() []uint32 {
-	content := make([]uint32, 0, 2*len(this.cache))
-	for key, value := range this.cache {
-		content = append(content, uint32(key), uint32(value))
-	}
-	return content
-}
-
-func init() {
-	value := byte(0)
-	for mask := byte(1); mask <= 8; mask++ {
-		value += 1 << byte(8-mask)
-		onesCount[value] = mask
-	}
+func (n *IPNetTable) IsEmpty() bool {
+	return len(n.cache) == 0
 }

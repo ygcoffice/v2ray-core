@@ -1,45 +1,23 @@
 package dns
 
+//go:generate go run $GOPATH/src/v2ray.com/core/tools/generrorgen/main.go -pkg dns -path App,DNS
+
 import (
 	"net"
 
-	"github.com/v2ray/v2ray-core/app"
+	"v2ray.com/core/app"
 )
 
-const (
-	APP_ID = app.ID(2)
-)
-
-// A DnsCache is an internal cache of DNS resolutions.
-type DnsCache interface {
-	Get(domain string) net.IP
-	Add(domain string, ip net.IP)
+// A Server is a DNS server for responding DNS queries.
+type Server interface {
+	Get(domain string) []net.IP
 }
 
-type dnsCacheWithContext interface {
-	Get(context app.Context, domain string) net.IP
-	Add(contaxt app.Context, domain string, ip net.IP)
-}
-
-type contextedDnsCache struct {
-	context  app.Context
-	dnsCache dnsCacheWithContext
-}
-
-func (this *contextedDnsCache) Get(domain string) net.IP {
-	return this.dnsCache.Get(this.context, domain)
-}
-
-func (this *contextedDnsCache) Add(domain string, ip net.IP) {
-	this.dnsCache.Add(this.context, domain, ip)
-}
-
-func init() {
-	app.RegisterApp(APP_ID, func(context app.Context, obj interface{}) interface{} {
-		dcContext := obj.(dnsCacheWithContext)
-		return &contextedDnsCache{
-			context:  context,
-			dnsCache: dcContext,
-		}
-	})
+// FromSpace fetches a DNS server from context.
+func FromSpace(space app.Space) Server {
+	app := space.GetApplication((*Server)(nil))
+	if app == nil {
+		return nil
+	}
+	return app.(Server)
 }

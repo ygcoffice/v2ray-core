@@ -1,214 +1,172 @@
 package outbound
 
+//go:generate go run $GOPATH/src/v2ray.com/core/tools/generrorgen/main.go -pkg outbound -path Proxy,VMess,Outbound
+
 import (
-	"crypto/md5"
-	"crypto/rand"
-	"io"
-	"net"
-	"sync"
+	"context"
 	"time"
 
-	"github.com/v2ray/v2ray-core/app"
-	"github.com/v2ray/v2ray-core/common/alloc"
-	v2crypto "github.com/v2ray/v2ray-core/common/crypto"
-	v2io "github.com/v2ray/v2ray-core/common/io"
-	"github.com/v2ray/v2ray-core/common/log"
-	v2net "github.com/v2ray/v2ray-core/common/net"
-	"github.com/v2ray/v2ray-core/proxy"
-	"github.com/v2ray/v2ray-core/proxy/internal"
-	vmessio "github.com/v2ray/v2ray-core/proxy/vmess/io"
-	"github.com/v2ray/v2ray-core/proxy/vmess/protocol"
-	"github.com/v2ray/v2ray-core/transport/ray"
+	"v2ray.com/core/app"
+	"v2ray.com/core/app/log"
+	"v2ray.com/core/common"
+	"v2ray.com/core/common/buf"
+	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/protocol"
+	"v2ray.com/core/common/retry"
+	"v2ray.com/core/common/signal"
+	"v2ray.com/core/proxy"
+	"v2ray.com/core/proxy/vmess"
+	"v2ray.com/core/proxy/vmess/encoding"
+	"v2ray.com/core/transport/internet"
+	"v2ray.com/core/transport/ray"
 )
 
-type VMessOutboundHandler struct {
-	receiverManager *ReceiverManager
+// Handler is an outbound connection handler for VMess protocol.
+type Handler struct {
+	serverList   *protocol.ServerList
+	serverPicker protocol.ServerPicker
 }
 
-func (this *VMessOutboundHandler) Dispatch(firstPacket v2net.Packet, ray ray.OutboundRay) error {
-	vNextAddress, vNextUser := this.receiverManager.PickReceiver()
-
-	command := protocol.CmdTCP
-	if firstPacket.Destination().IsUDP() {
-		command = protocol.CmdUDP
-	}
-	request := &protocol.VMessRequest{
-		Version: protocol.Version,
-		User:    vNextUser,
-		Command: command,
-		Address: firstPacket.Destination().Address(),
-		Port:    firstPacket.Destination().Port(),
-	}
-	if command == protocol.CmdUDP {
-		request.Option |= protocol.OptionChunk
+func New(ctx context.Context, config *Config) (*Handler, error) {
+	space := app.SpaceFromContext(ctx)
+	if space == nil {
+		return nil, newError("no space in context.")
 	}
 
-	buffer := alloc.NewSmallBuffer()
-	defer buffer.Release()                      // Buffer is released after communication finishes.
-	io.ReadFull(rand.Reader, buffer.Value[:33]) // 16 + 16 + 1
-	request.RequestIV = buffer.Value[:16]
-	request.RequestKey = buffer.Value[16:32]
-	request.ResponseHeader = buffer.Value[32]
+	serverList := protocol.NewServerList()
+	for _, rec := range config.Receiver {
+		serverList.AddServer(protocol.NewServerSpecFromPB(*rec))
+	}
+	handler := &Handler{
+		serverList:   serverList,
+		serverPicker: protocol.NewRoundRobinServerPicker(serverList),
+	}
 
-	return this.startCommunicate(request, vNextAddress, ray, firstPacket)
+	return handler, nil
 }
 
-func (this *VMessOutboundHandler) startCommunicate(request *protocol.VMessRequest, dest v2net.Destination, ray ray.OutboundRay, firstPacket v2net.Packet) error {
-	var destIP net.IP
-	if dest.Address().IsIPv4() || dest.Address().IsIPv6() {
-		destIP = dest.Address().IP()
-	} else {
-		ips, err := net.LookupIP(dest.Address().Domain())
+// Process implements proxy.Outbound.Process().
+func (v *Handler) Process(ctx context.Context, outboundRay ray.OutboundRay, dialer proxy.Dialer) error {
+	var rec *protocol.ServerSpec
+	var conn internet.Connection
+
+	err := retry.ExponentialBackoff(5, 200).On(func() error {
+		rec = v.serverPicker.PickServer()
+		rawConn, err := dialer.Dial(ctx, rec.Destination())
 		if err != nil {
 			return err
 		}
-		destIP = ips[0]
-	}
-	conn, err := net.DialTCP("tcp", nil, &net.TCPAddr{
-		IP:   destIP,
-		Port: int(dest.Port()),
+		conn = rawConn
+
+		return nil
 	})
 	if err != nil {
-		log.Error("Failed to open ", dest, ": ", err)
-		if ray != nil {
-			close(ray.OutboundOutput())
-		}
-		return err
+		return newError("failed to find an available destination").Base(err).AtWarning()
 	}
-	log.Info("VMessOut: Tunneling request to ", request.Address, " via ", dest)
-
 	defer conn.Close()
 
-	input := ray.OutboundInput()
-	output := ray.OutboundOutput()
+	target, ok := proxy.TargetFromContext(ctx)
+	if !ok {
+		return newError("target not specified").AtError()
+	}
+	log.Trace(newError("tunneling request to ", target, " via ", rec.Destination()))
 
-	var requestFinish, responseFinish sync.Mutex
-	requestFinish.Lock()
-	responseFinish.Lock()
+	command := protocol.RequestCommandTCP
+	if target.Network == net.Network_UDP {
+		command = protocol.RequestCommandUDP
+	}
+	//if target.Address.Family().IsDomain() && target.Address.Domain() == "v1.mux.com" {
+	//	command = protocol.RequestCommandMux
+	//}
+	request := &protocol.RequestHeader{
+		Version: encoding.Version,
+		User:    rec.PickUser(),
+		Command: command,
+		Address: target.Address,
+		Port:    target.Port,
+		Option:  protocol.RequestOptionChunkStream,
+	}
 
-	go this.handleRequest(conn, request, firstPacket, input, &requestFinish)
-	go this.handleResponse(conn, request, dest, output, &responseFinish)
+	rawAccount, err := request.User.GetTypedAccount()
+	if err != nil {
+		return newError("failed to get user account").Base(err).AtWarning()
+	}
+	account := rawAccount.(*vmess.InternalAccount)
+	request.Security = account.Security
 
-	requestFinish.Lock()
-	conn.CloseWrite()
-	responseFinish.Lock()
+	if request.Security.Is(protocol.SecurityType_AES128_GCM) || request.Security.Is(protocol.SecurityType_NONE) || request.Security.Is(protocol.SecurityType_CHACHA20_POLY1305) {
+		request.Option.Set(protocol.RequestOptionChunkMasking)
+	}
+
+	input := outboundRay.OutboundInput()
+	output := outboundRay.OutboundOutput()
+
+	session := encoding.NewClientSession(protocol.DefaultIDHash)
+
+	ctx, timer := signal.CancelAfterInactivity(ctx, time.Minute*5)
+
+	requestDone := signal.ExecuteAsync(func() error {
+		writer := buf.NewBufferedWriter(buf.NewWriter(conn))
+		if err := session.EncodeRequestHeader(request, writer); err != nil {
+			return newError("failed to encode request").Base(err).AtWarning()
+		}
+
+		bodyWriter := session.EncodeRequestBody(request, writer)
+		firstPayload, err := input.ReadTimeout(time.Millisecond * 500)
+		if err != nil && err != buf.ErrReadTimeout {
+			return newError("failed to get first payload").Base(err)
+		}
+		if !firstPayload.IsEmpty() {
+			if err := bodyWriter.WriteMultiBuffer(firstPayload); err != nil {
+				return newError("failed to write first payload").Base(err)
+			}
+			firstPayload.Release()
+		}
+
+		if err := writer.SetBuffered(false); err != nil {
+			return err
+		}
+
+		if err := buf.Copy(input, bodyWriter, buf.UpdateActivity(timer)); err != nil {
+			return err
+		}
+
+		if request.Option.Has(protocol.RequestOptionChunkStream) {
+			if err := bodyWriter.WriteMultiBuffer(buf.MultiBuffer{}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	responseDone := signal.ExecuteAsync(func() error {
+		defer output.Close()
+
+		reader := buf.NewBufferedReader(buf.NewReader(conn))
+		header, err := session.DecodeResponseHeader(reader)
+		if err != nil {
+			return err
+		}
+		v.handleCommand(rec.Destination(), header.Command)
+
+		reader.SetBuffered(false)
+		bodyReader := session.DecodeResponseBody(request, reader)
+		if err := buf.Copy(bodyReader, output, buf.UpdateActivity(timer)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err := signal.ErrorOrFinish2(ctx, requestDone, responseDone); err != nil {
+		return newError("connection ends").Base(err)
+	}
+
 	return nil
 }
 
-func (this *VMessOutboundHandler) handleRequest(conn net.Conn, request *protocol.VMessRequest, firstPacket v2net.Packet, input <-chan *alloc.Buffer, finish *sync.Mutex) {
-	defer finish.Unlock()
-	aesStream, err := v2crypto.NewAesEncryptionStream(request.RequestKey[:], request.RequestIV[:])
-	if err != nil {
-		log.Error("VMessOut: Failed to create AES encryption stream: ", err)
-		return
-	}
-	encryptRequestWriter := v2crypto.NewCryptionWriter(aesStream, conn)
-
-	buffer := alloc.NewBuffer().Clear()
-	defer buffer.Release()
-	buffer, err = request.ToBytes(protocol.NewRandomTimestampGenerator(protocol.Timestamp(time.Now().Unix()), 30), buffer)
-	if err != nil {
-		log.Error("VMessOut: Failed to serialize VMess request: ", err)
-		return
-	}
-
-	// Send first packet of payload together with request, in favor of small requests.
-	firstChunk := firstPacket.Chunk()
-	moreChunks := firstPacket.MoreChunks()
-
-	for firstChunk == nil && moreChunks {
-		firstChunk, moreChunks = <-input
-	}
-
-	if firstChunk == nil && !moreChunks {
-		log.Warning("VMessOut: Nothing to send. Existing...")
-		return
-	}
-
-	if request.IsChunkStream() {
-		vmessio.Authenticate(firstChunk)
-	}
-
-	aesStream.XORKeyStream(firstChunk.Value, firstChunk.Value)
-	buffer.Append(firstChunk.Value)
-	firstChunk.Release()
-
-	_, err = conn.Write(buffer.Value)
-	if err != nil {
-		log.Error("VMessOut: Failed to write VMess request: ", err)
-		return
-	}
-
-	if moreChunks {
-		var streamWriter v2io.Writer = v2io.NewAdaptiveWriter(encryptRequestWriter)
-		if request.IsChunkStream() {
-			streamWriter = vmessio.NewAuthChunkWriter(streamWriter)
-		}
-		v2io.ChanToWriter(streamWriter, input)
-	}
-	return
-}
-
-func headerMatch(request *protocol.VMessRequest, responseHeader byte) bool {
-	return request.ResponseHeader == responseHeader
-}
-
-func (this *VMessOutboundHandler) handleResponse(conn net.Conn, request *protocol.VMessRequest, dest v2net.Destination, output chan<- *alloc.Buffer, finish *sync.Mutex) {
-	defer finish.Unlock()
-	defer close(output)
-	responseKey := md5.Sum(request.RequestKey[:])
-	responseIV := md5.Sum(request.RequestIV[:])
-
-	aesStream, err := v2crypto.NewAesDecryptionStream(responseKey[:], responseIV[:])
-	if err != nil {
-		log.Error("VMessOut: Failed to create AES encryption stream: ", err)
-		return
-	}
-	decryptResponseReader := v2crypto.NewCryptionReader(aesStream, conn)
-
-	buffer := alloc.NewSmallBuffer()
-	defer buffer.Release()
-	_, err = io.ReadFull(decryptResponseReader, buffer.Value[:4])
-
-	if err != nil {
-		log.Error("VMessOut: Failed to read VMess response (", buffer.Len(), " bytes): ", err)
-		return
-	}
-	if !headerMatch(request, buffer.Value[0]) {
-		log.Warning("VMessOut: unexepcted response header. The connection is probably hijacked.")
-		return
-	}
-
-	if buffer.Value[2] != 0 {
-		command := buffer.Value[2]
-		dataLen := int(buffer.Value[3])
-		_, err := io.ReadFull(decryptResponseReader, buffer.Value[:dataLen])
-		if err != nil {
-			log.Error("VMessOut: Failed to read response command: ", err)
-			return
-		}
-		data := buffer.Value[:dataLen]
-		go this.handleCommand(dest, command, data)
-	}
-
-	var reader v2io.Reader
-	if request.IsChunkStream() {
-		reader = vmessio.NewAuthChunkReader(decryptResponseReader)
-	} else {
-		reader = v2io.NewAdaptiveReader(decryptResponseReader)
-	}
-
-	v2io.ReaderToChan(output, reader)
-
-	return
-}
-
 func init() {
-	internal.MustRegisterOutboundHandlerCreator("vmess",
-		func(space app.Space, rawConfig interface{}) (proxy.OutboundHandler, error) {
-			vOutConfig := rawConfig.(*Config)
-			return &VMessOutboundHandler{
-				receiverManager: NewReceiverManager(vOutConfig.Receivers),
-			}, nil
-		})
+	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+		return New(ctx, config.(*Config))
+	}))
 }

@@ -1,12 +1,13 @@
 package retry
 
+//go:generate go run $GOPATH/src/v2ray.com/core/tools/generrorgen/main.go -pkg retry -path Retry
+
 import (
-	"errors"
 	"time"
 )
 
 var (
-	errorRetryFailed = errors.New("All retry attempts failed.")
+	ErrRetryFailed = newError("all retry attempts failed")
 )
 
 // Strategy is a way to retry on a specific function.
@@ -16,34 +17,48 @@ type Strategy interface {
 }
 
 type retryer struct {
-	NextDelay func(int) int
+	totalAttempt int
+	nextDelay    func() uint32
 }
 
 // On implements Strategy.On.
 func (r *retryer) On(method func() error) error {
 	attempt := 0
-	for {
+	accumulatedError := make([]error, 0, r.totalAttempt)
+	for attempt < r.totalAttempt {
 		err := method()
 		if err == nil {
 			return nil
 		}
-		delay := r.NextDelay(attempt)
-		if delay < 0 {
-			return errorRetryFailed
+		numErrors := len(accumulatedError)
+		if numErrors == 0 || err.Error() != accumulatedError[numErrors-1].Error() {
+			accumulatedError = append(accumulatedError, err)
 		}
-		<-time.After(time.Duration(delay) * time.Millisecond)
+		delay := r.nextDelay()
+		time.Sleep(time.Duration(delay) * time.Millisecond)
 		attempt++
 	}
+	return newError(accumulatedError).Base(ErrRetryFailed)
 }
 
 // Timed returns a retry strategy with fixed interval.
-func Timed(attempts int, delay int) Strategy {
+func Timed(attempts int, delay uint32) Strategy {
 	return &retryer{
-		NextDelay: func(attempt int) int {
-			if attempt >= attempts {
-				return -1
-			}
+		totalAttempt: attempts,
+		nextDelay: func() uint32 {
 			return delay
+		},
+	}
+}
+
+func ExponentialBackoff(attempts int, delay uint32) Strategy {
+	nextDelay := uint32(0)
+	return &retryer{
+		totalAttempt: attempts,
+		nextDelay: func() uint32 {
+			r := nextDelay
+			nextDelay += delay
+			return r
 		},
 	}
 }

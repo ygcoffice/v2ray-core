@@ -1,150 +1,126 @@
 package dokodemo
 
-import (
-	"io"
-	"sync"
+//go:generate go run $GOPATH/src/v2ray.com/core/tools/generrorgen/main.go -pkg dokodemo -path Proxy,Dokodemo
 
-	"github.com/v2ray/v2ray-core/app/dispatcher"
-	"github.com/v2ray/v2ray-core/common/alloc"
-	v2io "github.com/v2ray/v2ray-core/common/io"
-	"github.com/v2ray/v2ray-core/common/log"
-	v2net "github.com/v2ray/v2ray-core/common/net"
-	"github.com/v2ray/v2ray-core/proxy"
-	"github.com/v2ray/v2ray-core/transport/hub"
+import (
+	"context"
+	"time"
+
+	"v2ray.com/core/app"
+	"v2ray.com/core/app/dispatcher"
+	"v2ray.com/core/app/log"
+	"v2ray.com/core/common"
+	"v2ray.com/core/common/buf"
+	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/signal"
+	"v2ray.com/core/proxy"
+	"v2ray.com/core/transport/internet"
+	"v2ray.com/core/transport/internet/udp"
 )
 
 type DokodemoDoor struct {
-	tcpMutex         sync.RWMutex
-	udpMutex         sync.RWMutex
-	config           *Config
-	accepting        bool
-	address          v2net.Address
-	port             v2net.Port
-	packetDispatcher dispatcher.PacketDispatcher
-	tcpListener      *hub.TCPHub
-	udpHub           *hub.UDPHub
-	udpServer        *hub.UDPServer
-	listeningPort    v2net.Port
+	config  *Config
+	address net.Address
+	port    net.Port
 }
 
-func NewDokodemoDoor(config *Config, packetDispatcher dispatcher.PacketDispatcher) *DokodemoDoor {
-	return &DokodemoDoor{
-		config:           config,
-		packetDispatcher: packetDispatcher,
-		address:          config.Address,
-		port:             config.Port,
+func New(ctx context.Context, config *Config) (*DokodemoDoor, error) {
+	space := app.SpaceFromContext(ctx)
+	if space == nil {
+		return nil, newError("no space in context")
 	}
-}
-
-func (this *DokodemoDoor) Port() v2net.Port {
-	return this.listeningPort
-}
-
-func (this *DokodemoDoor) Close() {
-	this.accepting = false
-	if this.tcpListener != nil {
-		this.tcpMutex.Lock()
-		this.tcpListener.Close()
-		this.tcpListener = nil
-		this.tcpMutex.Unlock()
+	if config.NetworkList == nil || config.NetworkList.Size() == 0 {
+		return nil, newError("no network specified")
 	}
-	if this.udpHub != nil {
-		this.udpMutex.Lock()
-		this.udpHub.Close()
-		this.udpHub = nil
-		this.udpMutex.Unlock()
+	d := &DokodemoDoor{
+		config:  config,
+		address: config.GetPredefinedAddress(),
+		port:    net.Port(config.Port),
 	}
+	return d, nil
 }
 
-func (this *DokodemoDoor) Listen(port v2net.Port) error {
-	if this.accepting {
-		if this.listeningPort == port {
-			return nil
-		} else {
-			return proxy.ErrorAlreadyListening
+func (d *DokodemoDoor) Network() net.NetworkList {
+	return *(d.config.NetworkList)
+}
+
+func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn internet.Connection, dispatcher dispatcher.Interface) error {
+	log.Trace(newError("processing connection from: ", conn.RemoteAddr()).AtDebug())
+	dest := net.Destination{
+		Network: network,
+		Address: d.address,
+		Port:    d.port,
+	}
+	if d.config.FollowRedirect {
+		if origDest, ok := proxy.OriginalTargetFromContext(ctx); ok {
+			dest = origDest
 		}
 	}
-	this.listeningPort = port
-	this.accepting = true
-
-	if this.config.Network.HasNetwork(v2net.TCPNetwork) {
-		err := this.ListenTCP(port)
-		if err != nil {
-			return err
-		}
+	if !dest.IsValid() || dest.Address == nil {
+		return newError("unable to get destination")
 	}
-	if this.config.Network.HasNetwork(v2net.UDPNetwork) {
-		err := this.ListenUDP(port)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
 
-func (this *DokodemoDoor) ListenUDP(port v2net.Port) error {
-	this.udpServer = hub.NewUDPServer(this.packetDispatcher)
-	udpHub, err := hub.ListenUDP(port, this.handleUDPPackets)
+	timeout := time.Second * time.Duration(d.config.Timeout)
+	if timeout == 0 {
+		timeout = time.Minute * 5
+	}
+	ctx, timer := signal.CancelAfterInactivity(ctx, timeout)
+
+	inboundRay, err := dispatcher.Dispatch(ctx, dest)
 	if err != nil {
-		log.Error("Dokodemo failed to listen on port ", port, ": ", err)
-		return err
+		return newError("failed to dispatch request").Base(err)
 	}
-	this.udpMutex.Lock()
-	this.udpHub = udpHub
-	this.udpMutex.Unlock()
-	return nil
-}
 
-func (this *DokodemoDoor) handleUDPPackets(payload *alloc.Buffer, dest v2net.Destination) {
-	packet := v2net.NewPacket(v2net.UDPDestination(this.address, this.port), payload, false)
-	this.udpServer.Dispatch(dest, packet, func(packet v2net.Packet) {
-		defer packet.Chunk().Release()
-		this.udpMutex.RLock()
-		if !this.accepting {
-			this.udpMutex.RUnlock()
-			return
+	requestDone := signal.ExecuteAsync(func() error {
+		defer inboundRay.InboundInput().Close()
+
+		chunkReader := buf.NewReader(conn)
+
+		if err := buf.Copy(chunkReader, inboundRay.InboundInput(), buf.UpdateActivity(timer)); err != nil {
+			return newError("failed to transport request").Base(err)
 		}
-		this.udpHub.WriteTo(packet.Chunk().Value, packet.Destination())
-		this.udpMutex.RUnlock()
+
+		return nil
 	})
-}
 
-func (this *DokodemoDoor) ListenTCP(port v2net.Port) error {
-	tcpListener, err := hub.ListenTCP(port, this.HandleTCPConnection)
-	if err != nil {
-		log.Error("Dokodemo: Failed to listen on port ", port, ": ", err)
-		return err
+	responseDone := signal.ExecuteAsync(func() error {
+		var writer buf.Writer
+		if network == net.Network_TCP {
+			writer = buf.NewWriter(conn)
+		} else {
+			//if we are in TPROXY mode, use linux's udp forging functionality
+			if !d.config.FollowRedirect {
+				writer = buf.NewSequentialWriter(conn)
+			} else {
+				srca := net.UDPAddr{IP: dest.Address.IP(), Port: int(dest.Port.Value())}
+				origsend, err := udp.TransmitSocket(&srca, conn.RemoteAddr())
+				if err != nil {
+					return err
+				}
+				writer = buf.NewSequentialWriter(origsend)
+			}
+		}
+
+		if err := buf.Copy(inboundRay.InboundOutput(), writer, buf.UpdateActivity(timer)); err != nil {
+			return newError("failed to transport response").Base(err)
+		}
+
+		timer.SetTimeout(time.Second * 2)
+
+		return nil
+	})
+
+	if err := signal.ErrorOrFinish2(ctx, requestDone, responseDone); err != nil {
+		inboundRay.InboundInput().CloseError()
+		inboundRay.InboundOutput().CloseError()
+		return newError("connection ends").Base(err)
 	}
-	this.tcpMutex.Lock()
-	this.tcpListener = tcpListener
-	this.tcpMutex.Unlock()
+
 	return nil
 }
 
-func (this *DokodemoDoor) HandleTCPConnection(conn *hub.TCPConn) {
-	defer conn.Close()
-
-	packet := v2net.NewPacket(v2net.TCPDestination(this.address, this.port), nil, true)
-	ray := this.packetDispatcher.DispatchToOutbound(packet)
-
-	var inputFinish, outputFinish sync.Mutex
-	inputFinish.Lock()
-	outputFinish.Lock()
-
-	reader := v2net.NewTimeOutReader(this.config.Timeout, conn)
-	go dumpInput(reader, ray.InboundInput(), &inputFinish)
-	go dumpOutput(conn, ray.InboundOutput(), &outputFinish)
-
-	outputFinish.Lock()
-}
-
-func dumpInput(reader io.Reader, input chan<- *alloc.Buffer, finish *sync.Mutex) {
-	v2io.RawReaderToChan(input, reader)
-	finish.Unlock()
-	close(input)
-}
-
-func dumpOutput(writer io.Writer, output <-chan *alloc.Buffer, finish *sync.Mutex) {
-	v2io.ChanToRawWriter(writer, output)
-	finish.Unlock()
+func init() {
+	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+		return New(ctx, config.(*Config))
+	}))
 }

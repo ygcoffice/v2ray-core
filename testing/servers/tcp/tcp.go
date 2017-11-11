@@ -2,42 +2,45 @@ package tcp
 
 import (
 	"fmt"
-	"net"
+	"io"
 
-	v2io "github.com/v2ray/v2ray-core/common/io"
-	v2net "github.com/v2ray/v2ray-core/common/net"
+	"v2ray.com/core/common/net"
 )
 
 type Server struct {
-	Port         v2net.Port
+	Port         net.Port
 	MsgProcessor func(msg []byte) []byte
-	accepting    bool
+	SendFirst    []byte
+	Listen       net.Address
 	listener     *net.TCPListener
 }
 
-func (server *Server) Start() (v2net.Destination, error) {
+func (server *Server) Start() (net.Destination, error) {
+	listenerAddr := server.Listen
+	if listenerAddr == nil {
+		listenerAddr = net.LocalHostIP
+	}
 	listener, err := net.ListenTCP("tcp", &net.TCPAddr{
-		IP:   []byte{0, 0, 0, 0},
+		IP:   listenerAddr.IP(),
 		Port: int(server.Port),
 		Zone: "",
 	})
 	if err != nil {
-		return nil, err
+		return net.Destination{}, err
 	}
+	server.Port = net.Port(listener.Addr().(*net.TCPAddr).Port)
 	server.listener = listener
 	go server.acceptConnections(listener)
 	localAddr := listener.Addr().(*net.TCPAddr)
-	return v2net.TCPDestination(v2net.IPAddress(localAddr.IP), v2net.Port(localAddr.Port)), nil
+	return net.TCPDestination(net.IPAddress(localAddr.IP), net.Port(localAddr.Port)), nil
 }
 
 func (server *Server) acceptConnections(listener *net.TCPListener) {
-	server.accepting = true
-	defer listener.Close()
-	for server.accepting {
+	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Printf("Failed accept TCP connection: %v", err)
-			continue
+			fmt.Printf("Failed accept TCP connection: %v\n", err)
+			return
 		}
 
 		go server.handleConnection(conn)
@@ -45,18 +48,27 @@ func (server *Server) acceptConnections(listener *net.TCPListener) {
 }
 
 func (server *Server) handleConnection(conn net.Conn) {
-	for true {
-		request, err := v2io.ReadFrom(conn, nil)
+	if len(server.SendFirst) > 0 {
+		conn.Write(server.SendFirst)
+	}
+	request := make([]byte, 4096)
+	for {
+		nBytes, err := conn.Read(request)
 		if err != nil {
+			if err != io.EOF {
+				fmt.Println("Failed to read request:", err)
+			}
 			break
 		}
-		response := server.MsgProcessor(request.Value)
-		conn.Write(response)
+		response := server.MsgProcessor(request[:nBytes])
+		if _, err := conn.Write(response); err != nil {
+			fmt.Println("Failed to write response:", err)
+			break
+		}
 	}
 	conn.Close()
 }
 
-func (this *Server) Close() {
-	this.accepting = false
-	this.listener.Close()
+func (server *Server) Close() {
+	server.listener.Close()
 }

@@ -3,60 +3,22 @@ package crypto
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"io"
+
+	"v2ray.com/core/common"
 )
 
-func NewAesDecryptionStream(key []byte, iv []byte) (cipher.Stream, error) {
+// NewAesDecryptionStream creates a new AES encryption stream based on given key and IV.
+// Caller must ensure the length of key and IV is either 16, 24 or 32 bytes.
+func NewAesDecryptionStream(key []byte, iv []byte) cipher.Stream {
 	aesBlock, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-
-	return cipher.NewCFBDecrypter(aesBlock, iv), nil
+	common.Must(err)
+	return cipher.NewCFBDecrypter(aesBlock, iv)
 }
 
-func NewAesEncryptionStream(key []byte, iv []byte) (cipher.Stream, error) {
+// NewAesEncryptionStream creates a new AES description stream based on given key and IV.
+// Caller must ensure the length of key and IV is either 16, 24 or 32 bytes.
+func NewAesEncryptionStream(key []byte, iv []byte) cipher.Stream {
 	aesBlock, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-
-	return cipher.NewCFBEncrypter(aesBlock, iv), nil
-}
-
-type cryptionReader struct {
-	stream cipher.Stream
-	reader io.Reader
-}
-
-func NewCryptionReader(stream cipher.Stream, reader io.Reader) io.Reader {
-	return &cryptionReader{
-		stream: stream,
-		reader: reader,
-	}
-}
-
-func (this *cryptionReader) Read(data []byte) (int, error) {
-	nBytes, err := this.reader.Read(data)
-	if nBytes > 0 {
-		this.stream.XORKeyStream(data[:nBytes], data[:nBytes])
-	}
-	return nBytes, err
-}
-
-type cryptionWriter struct {
-	stream cipher.Stream
-	writer io.Writer
-}
-
-func NewCryptionWriter(stream cipher.Stream, writer io.Writer) io.Writer {
-	return &cryptionWriter{
-		stream: stream,
-		writer: writer,
-	}
-}
-
-func (this *cryptionWriter) Write(data []byte) (int, error) {
-	this.stream.XORKeyStream(data, data)
-	return this.writer.Write(data)
+	common.Must(err)
+	return cipher.NewCFBEncrypter(aesBlock, iv)
 }

@@ -1,36 +1,42 @@
 package serial
 
 import (
+	"fmt"
 	"strings"
 )
 
-// An interface for any objects that has string presentation.
-type String interface {
-	String() string
+// ToString serialize an abitrary value into string.
+func ToString(v interface{}) string {
+	if v == nil {
+		return " "
+	}
+
+	switch value := v.(type) {
+	case string:
+		return value
+	case *string:
+		return *value
+	case fmt.Stringer:
+		return value.String()
+	case error:
+		return value.Error()
+	case []byte:
+		return BytesToHexString(value)
+	default:
+		return fmt.Sprintf("%+v", value)
+	}
 }
 
-type StringLiteral string
-
-func NewStringLiteral(str String) StringLiteral {
-	return StringLiteral(str.String())
+func Concat(v ...interface{}) string {
+	values := make([]string, len(v))
+	for i, value := range v {
+		values[i] = ToString(value)
+	}
+	return strings.Join(values, "")
 }
 
-func (this StringLiteral) Contains(str String) bool {
-	return strings.Contains(this.String(), str.String())
-}
-
-func (this StringLiteral) String() string {
-	return string(this)
-}
-
-func (this StringLiteral) ToLower() StringLiteral {
-	return StringLiteral(strings.ToLower(string(this)))
-}
-
-func (this StringLiteral) ToUpper() StringLiteral {
-	return StringLiteral(strings.ToUpper(string(this)))
-}
-
-func (this StringLiteral) TrimSpace() StringLiteral {
-	return StringLiteral(strings.TrimSpace(string(this)))
+func WriteString(s string) func([]byte) (int, error) {
+	return func(b []byte) (int, error) {
+		return copy(b, []byte(s)), nil
+	}
 }

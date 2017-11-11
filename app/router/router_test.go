@@ -1,31 +1,48 @@
 package router_test
 
 import (
-	"net"
-	"path/filepath"
+	"context"
 	"testing"
 
-	. "github.com/v2ray/v2ray-core/app/router"
-	_ "github.com/v2ray/v2ray-core/app/router/rules"
-	v2net "github.com/v2ray/v2ray-core/common/net"
-	"github.com/v2ray/v2ray-core/shell/point"
-	v2testing "github.com/v2ray/v2ray-core/testing"
-	"github.com/v2ray/v2ray-core/testing/assert"
+	"v2ray.com/core/app"
+	"v2ray.com/core/app/dispatcher"
+	_ "v2ray.com/core/app/dispatcher/impl"
+	"v2ray.com/core/app/dns"
+	_ "v2ray.com/core/app/dns/server"
+	"v2ray.com/core/app/proxyman"
+	_ "v2ray.com/core/app/proxyman/outbound"
+	. "v2ray.com/core/app/router"
+	"v2ray.com/core/common/net"
+	"v2ray.com/core/proxy"
+	. "v2ray.com/ext/assert"
 )
 
-func TestRouter(t *testing.T) {
-	v2testing.Current(t)
+func TestSimpleRouter(t *testing.T) {
+	assert := With(t)
 
-	baseDir := "$GOPATH/src/github.com/v2ray/v2ray-core/release/config"
+	config := &Config{
+		Rule: []*RoutingRule{
+			{
+				Tag: "test",
+				NetworkList: &net.NetworkList{
+					Network: []net.Network{net.Network_TCP},
+				},
+			},
+		},
+	}
 
-	pointConfig, err := point.LoadConfig(filepath.Join(baseDir, "vpoint_socks_vmess.json"))
-	assert.Error(err).IsNil()
+	space := app.NewSpace()
+	ctx := app.ContextWithSpace(context.Background(), space)
+	assert(app.AddApplicationToSpace(ctx, new(dns.Config)), IsNil)
+	assert(app.AddApplicationToSpace(ctx, new(dispatcher.Config)), IsNil)
+	assert(app.AddApplicationToSpace(ctx, new(proxyman.OutboundConfig)), IsNil)
+	assert(app.AddApplicationToSpace(ctx, config), IsNil)
+	assert(space.Initialize(), IsNil)
 
-	router, err := CreateRouter(pointConfig.RouterConfig.Strategy, pointConfig.RouterConfig.Settings)
-	assert.Error(err).IsNil()
+	r := FromSpace(space)
 
-	dest := v2net.TCPDestination(v2net.IPAddress(net.ParseIP("120.135.126.1")), 80)
-	tag, err := router.TakeDetour(dest)
-	assert.Error(err).IsNil()
-	assert.StringLiteral(tag).Equals("direct")
+	ctx = proxy.ContextWithTarget(ctx, net.TCPDestination(net.DomainAddress("v2ray.com"), 80))
+	tag, err := r.TakeDetour(ctx)
+	assert(err, IsNil)
+	assert(tag, Equals, "test")
 }

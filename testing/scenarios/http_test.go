@@ -6,42 +6,157 @@ import (
 	"net/url"
 	"testing"
 
-	v2net "github.com/v2ray/v2ray-core/common/net"
-	v2testing "github.com/v2ray/v2ray-core/testing"
-	"github.com/v2ray/v2ray-core/testing/assert"
-	v2http "github.com/v2ray/v2ray-core/testing/servers/http"
+	"v2ray.com/core"
+	"v2ray.com/core/app/proxyman"
+	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/serial"
+	"v2ray.com/core/proxy/freedom"
+	v2http "v2ray.com/core/proxy/http"
+	v2httptest "v2ray.com/core/testing/servers/http"
+	. "v2ray.com/ext/assert"
 )
 
-func TestHttpProxy(t *testing.T) {
-	v2testing.Current(t)
+func TestHttpConformance(t *testing.T) {
+	assert := With(t)
 
-	httpServer := &v2http.Server{
-		Port:        v2net.Port(50042),
+	httpServerPort := pickPort()
+	httpServer := &v2httptest.Server{
+		Port:        httpServerPort,
 		PathHandler: make(map[string]http.HandlerFunc),
 	}
 	_, err := httpServer.Start()
-	assert.Error(err).IsNil()
+	assert(err, IsNil)
 	defer httpServer.Close()
 
-	assert.Error(InitializeServerSetOnce("test_5")).IsNil()
-
-	transport := &http.Transport{
-		Proxy: func(req *http.Request) (*url.URL, error) {
-			return url.Parse("http://127.0.0.1:50040/")
+	serverPort := pickPort()
+	serverConfig := &core.Config{
+		Inbound: []*proxyman.InboundHandlerConfig{
+			{
+				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+					PortRange: net.SinglePortRange(serverPort),
+					Listen:    net.NewIPOrDomain(net.LocalHostIP),
+				}),
+				ProxySettings: serial.ToTypedMessage(&v2http.ServerConfig{}),
+			},
+		},
+		Outbound: []*proxyman.OutboundHandlerConfig{
+			{
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+			},
 		},
 	}
 
-	client := &http.Client{
-		Transport: transport,
+	servers, err := InitializeServerConfigs(serverConfig)
+	assert(err, IsNil)
+
+	{
+		transport := &http.Transport{
+			Proxy: func(req *http.Request) (*url.URL, error) {
+				return url.Parse("http://127.0.0.1:" + serverPort.String())
+			},
+		}
+
+		client := &http.Client{
+			Transport: transport,
+		}
+
+		resp, err := client.Get("http://127.0.0.1:" + httpServerPort.String())
+		assert(err, IsNil)
+		assert(resp.StatusCode, Equals, 200)
+
+		content, err := ioutil.ReadAll(resp.Body)
+		assert(err, IsNil)
+		assert(string(content), Equals, "Home")
+
 	}
 
-	resp, err := client.Get("http://127.0.0.1:50042/")
-	assert.Error(err).IsNil()
-	assert.Int(resp.StatusCode).Equals(200)
+	CloseAllServers(servers)
+}
 
-	content, err := ioutil.ReadAll(resp.Body)
-	assert.Error(err).IsNil()
-	assert.StringLiteral(string(content)).Equals("Home")
+func setProxyBasicAuth(req *http.Request, user, pass string) {
+	req.SetBasicAuth(user, pass)
+	req.Header.Set("Proxy-Authorization", req.Header.Get("Authorization"))
+	req.Header.Del("Authorization")
+}
 
-	CloseAllServers()
+func TestHttpBasicAuth(t *testing.T) {
+	assert := With(t)
+
+	httpServerPort := pickPort()
+	httpServer := &v2httptest.Server{
+		Port:        httpServerPort,
+		PathHandler: make(map[string]http.HandlerFunc),
+	}
+	_, err := httpServer.Start()
+	assert(err, IsNil)
+	defer httpServer.Close()
+
+	serverPort := pickPort()
+	serverConfig := &core.Config{
+		Inbound: []*proxyman.InboundHandlerConfig{
+			{
+				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+					PortRange: net.SinglePortRange(serverPort),
+					Listen:    net.NewIPOrDomain(net.LocalHostIP),
+				}),
+				ProxySettings: serial.ToTypedMessage(&v2http.ServerConfig{
+					Accounts: map[string]string{
+						"a": "b",
+					},
+				}),
+			},
+		},
+		Outbound: []*proxyman.OutboundHandlerConfig{
+			{
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+			},
+		},
+	}
+
+	servers, err := InitializeServerConfigs(serverConfig)
+	assert(err, IsNil)
+
+	{
+		transport := &http.Transport{
+			Proxy: func(req *http.Request) (*url.URL, error) {
+				return url.Parse("http://127.0.0.1:" + serverPort.String())
+			},
+		}
+
+		client := &http.Client{
+			Transport: transport,
+		}
+
+		{
+			resp, err := client.Get("http://127.0.0.1:" + httpServerPort.String())
+			assert(err, IsNil)
+			assert(resp.StatusCode, Equals, 401)
+		}
+
+		{
+			req, err := http.NewRequest("GET", "http://127.0.0.1:"+httpServerPort.String(), nil)
+			assert(err, IsNil)
+
+			setProxyBasicAuth(req, "a", "c")
+			resp, err := client.Do(req)
+			assert(err, IsNil)
+			assert(resp.StatusCode, Equals, 401)
+		}
+
+		{
+			req, err := http.NewRequest("GET", "http://127.0.0.1:"+httpServerPort.String(), nil)
+			assert(err, IsNil)
+
+			setProxyBasicAuth(req, "a", "b")
+			resp, err := client.Do(req)
+			assert(err, IsNil)
+			assert(resp.StatusCode, Equals, 200)
+
+			content, err := ioutil.ReadAll(resp.Body)
+			assert(err, IsNil)
+			assert(string(content), Equals, "Home")
+		}
+	}
+
+	CloseAllServers(servers)
 }

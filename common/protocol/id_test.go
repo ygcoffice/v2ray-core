@@ -3,16 +3,15 @@ package protocol_test
 import (
 	"testing"
 
-	. "github.com/v2ray/v2ray-core/common/protocol"
-	"github.com/v2ray/v2ray-core/common/serial"
-	"github.com/v2ray/v2ray-core/common/uuid"
-	v2testing "github.com/v2ray/v2ray-core/testing"
-	"github.com/v2ray/v2ray-core/testing/assert"
+	"v2ray.com/core/common/predicate"
+	. "v2ray.com/core/common/protocol"
+	"v2ray.com/core/common/uuid"
+	. "v2ray.com/ext/assert"
 )
 
 func TestCmdKey(t *testing.T) {
-	v2testing.Current(t)
+	assert := With(t)
 
 	id := NewID(uuid.New())
-	assert.Bool(serial.BytesLiteral(id.CmdKey()).All(0)).IsFalse()
+	assert(predicate.BytesAll(id.CmdKey(), 0), IsFalse)
 }

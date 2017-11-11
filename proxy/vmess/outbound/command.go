@@ -1,48 +1,40 @@
 package outbound
 
 import (
-	"hash/fnv"
+	"time"
 
-	"github.com/v2ray/v2ray-core/common/log"
-	v2net "github.com/v2ray/v2ray-core/common/net"
-	proto "github.com/v2ray/v2ray-core/common/protocol"
-	"github.com/v2ray/v2ray-core/common/serial"
-	"github.com/v2ray/v2ray-core/proxy/vmess/command"
+	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/protocol"
+	"v2ray.com/core/common/serial"
+	"v2ray.com/core/proxy/vmess"
 )
 
-func (this *VMessOutboundHandler) handleSwitchAccount(cmd *command.SwitchAccount) {
-	user := proto.NewUser(proto.NewID(cmd.ID), cmd.Level, cmd.AlterIds.Value())
-	dest := v2net.TCPDestination(cmd.Host, cmd.Port)
-	this.receiverManager.AddDetour(NewReceiver(dest, user), cmd.ValidMin)
+func (h *Handler) handleSwitchAccount(cmd *protocol.CommandSwitchAccount) {
+	account := &vmess.Account{
+		Id:      cmd.ID.String(),
+		AlterId: uint32(cmd.AlterIds),
+		SecuritySettings: &protocol.SecurityConfig{
+			Type: protocol.SecurityType_LEGACY,
+		},
+	}
+
+	user := &protocol.User{
+		Email:   "",
+		Level:   cmd.Level,
+		Account: serial.ToTypedMessage(account),
+	}
+	dest := net.TCPDestination(cmd.Host, cmd.Port)
+	until := time.Now().Add(time.Duration(cmd.ValidMin) * time.Minute)
+	h.serverList.AddServer(protocol.NewServerSpec(dest, protocol.BeforeTime(until), user))
 }
 
-func (this *VMessOutboundHandler) handleCommand(dest v2net.Destination, cmdId byte, data []byte) {
-	if len(data) < 4 {
-		return
-	}
-	fnv1hash := fnv.New32a()
-	fnv1hash.Write(data[4:])
-	actualHashValue := fnv1hash.Sum32()
-	expectedHashValue := serial.BytesLiteral(data[:4]).Uint32Value()
-	if actualHashValue != expectedHashValue {
-		return
-	}
-	data = data[4:]
-	cmd, err := command.CreateResponseCommand(cmdId)
-	if err != nil {
-		log.Warning("VMessOut: Unknown response command (", cmdId, "): ", err)
-		return
-	}
-	if err := cmd.Unmarshal(data); err != nil {
-		log.Warning("VMessOut: Failed to parse response command: ", err)
-		return
-	}
+func (h *Handler) handleCommand(dest net.Destination, cmd protocol.ResponseCommand) {
 	switch typedCommand := cmd.(type) {
-	case *command.SwitchAccount:
+	case *protocol.CommandSwitchAccount:
 		if typedCommand.Host == nil {
-			typedCommand.Host = dest.Address()
+			typedCommand.Host = dest.Address
 		}
-		this.handleSwitchAccount(typedCommand)
+		h.handleSwitchAccount(typedCommand)
 	default:
 	}
 }

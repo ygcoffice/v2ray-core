@@ -15,6 +15,11 @@ func Roll(n int) int {
 	return rand.Intn(n)
 }
 
+// RollUint16 returns a random uint16 value.
+func RollUint16() uint16 {
+	return uint16(rand.Intn(65536))
+}
+
 func init() {
 	rand.Seed(time.Now().Unix())
 }
